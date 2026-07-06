@@ -17,6 +17,7 @@ from ..graph_bytecode_inputs import (
     register_user_object,
     reset_user_object_tracking,
 )
+
 from ..source import CurrentStreamSource
 from .base import VariableTracker
 from .constant import ConstantVariable
