@@ -73,6 +73,13 @@ class C10_CUDA_API CUDAAllocatorConfig {
 
   static bool expandable_segments();
 
+  // Reuse the physical pages of idle expandable-segment blocks by mapping them
+  // a second time into freshly reserved address space, instead of allocating
+  // new physical for a request the base segment cannot cover contiguously.
+  // Requires expandable_segments; returns false (warning once) without it, so
+  // turning expandable_segments off at runtime also turns this off.
+  static bool expandable_segments_idle_remap();
+
   static bool release_lock_on_cudamalloc() {
     return instance().m_release_lock_on_cudamalloc;
   }
@@ -248,6 +255,7 @@ class C10_CUDA_API CUDAAllocatorConfig {
         "per_process_memory_fraction",
         "pinned_free_catch_all",
         "throw_on_cudamalloc_oom",
+        "expandable_segments_idle_remap",
         "expandable_segments_reserve",
         "expandable_segments_reserve_by_class"};
     return keys;
@@ -283,6 +291,9 @@ class C10_CUDA_API CUDAAllocatorConfig {
   size_t parseThrowOnCudaMallocOom(
       const c10::CachingAllocator::ConfigTokenizer& tokenizer,
       size_t i);
+  size_t parseExpandableSegmentsIdleRemap(
+      const c10::CachingAllocator::ConfigTokenizer& tokenizer,
+      size_t i);
   size_t parseExpandableSegmentsReserve(
       const c10::CachingAllocator::ConfigTokenizer& tokenizer,
       size_t i);
@@ -305,6 +316,10 @@ class C10_CUDA_API CUDAAllocatorConfig {
   // When true, throw OOM error before calling cudaMalloc if allocation would
   // fail
   std::atomic<bool> m_throw_on_cudamalloc_oom{false};
+  // Read through expandable_segments_idle_remap(), which also gates on
+  // expandable_segments(); the stored value is what the user asked for, so a
+  // later expandable_segments:True re-parse picks it back up.
+  std::atomic<bool> m_expandable_segments_idle_remap{false};
   // Per-stream expandable-segment reserve config. Parsed once at init (like the
   // rest of PYTORCH_CUDA_ALLOC_CONF); read on the segment-creation path.
   // Default reserve, applied to untagged streams and to classes with no

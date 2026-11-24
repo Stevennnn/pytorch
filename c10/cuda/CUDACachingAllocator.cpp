@@ -199,6 +199,57 @@ void decrease_stat_array(
 
 struct Block;
 struct PrivatePool;
+struct ExpandableSegment;
+
+// Stand-in for CUmemGenericAllocationHandle / hipMemGenericAllocationHandle.
+// Both are `unsigned long long`, and the alias ledger hangs off BlockPool,
+// which is declared before the driver-API guard that makes those names
+// available.
+using PhysicalHandleKey = uint64_t;
+
+// One virtual-address position that maps a given physical page. Several
+// segments can map the same page once expandable_segments_idle_remap is on.
+struct AliasMapPoint {
+  ExpandableSegment* seg;
+  size_t index;
+};
+
+// Refcount and ownership record for a physical page that has more than one
+// mapping. Only such pages appear here, so the map stays empty in the steady
+// state and the `aliased_handles_.empty()` fast paths hold.
+struct PhysicalHandleLedger {
+  // points[0] is, by convention, the home (base-segment) mapping point;
+  // the rest are alias mapping points.
+  c10::SmallVector<AliasMapPoint, 4> points;
+  // The segment whose view currently serves a live allocation off this page,
+  // or null when the page is idle. Only one view may hold it at a time: two
+  // allocations writing one page through two addresses would corrupt each
+  // other.
+  ExpandableSegment* active = nullptr;
+};
+
+// An idle physical page offered to an alias segment, identified by where its
+// home mapping lives.
+struct DonorPage {
+  ExpandableSegment* seg;
+  size_t index;
+  PhysicalHandleKey handle;
+
+  DonorPage(ExpandableSegment* seg, size_t index, PhysicalHandleKey handle)
+      : seg(seg), index(index), handle(handle) {}
+};
+
+// Outcome of reserving address space for an alias segment. A plain enum rather
+// than a driver status so the alias paths also compile in builds without the
+// CUDA driver API headers, where CUresult is not declared.
+enum class AliasReserveResult {
+  kSuccess,
+  // The driver refused the reservation: address space is exhausted, which a VA
+  // reclaim can act on.
+  kOutOfAddressSpace,
+  // Anything else. A real failure, so it is raised rather than fallen back on.
+  kError,
+};
 
 struct BlockComparatorSizeCounterAddress {
   bool operator()(const Block* a, const Block* b) const;
@@ -221,6 +272,9 @@ struct BlockPool {
   const bool is_small;
   PrivatePool* owner_PrivatePool;
   int64_t get_free_blocks_call_count{0};
+  // Physical pages of this pool that have more than one virtual mapping.
+  // Empty unless expandable_segments_idle_remap built an alias segment.
+  ska::flat_hash_map<PhysicalHandleKey, PhysicalHandleLedger> aliased_handles_;
 
   // Add a Block into blocks set with updating gc counter.
   std::pair<decltype(blocks)::iterator, bool> insert_into_blocks(Block* block);
@@ -228,8 +282,6 @@ struct BlockPool {
 
   MempoolId_t owner_MempoolId() const;
 };
-
-struct ExpandableSegment;
 
 struct Block {
   c10::DeviceIndex device; // gpu
@@ -316,6 +368,177 @@ size_t BlockPool::erase_from_blocks(Block* block) {
   auto erased_by_addr = blocks_by_addr.erase(block);
   TORCH_INTERNAL_ASSERT(erased == erased_by_addr);
   return erased;
+}
+
+// Alias ledger bookkeeping that only needs ExpandableSegment by pointer. The
+// helpers that reach into a segment follow its definition, after the
+// driver-API guard, so that both the real and the unsupported-platform stub
+// segment satisfy them.
+//
+// ExpandableSegment::poisoned_pages_ counts, per segment, the ledger pages
+// whose `active` view is some other segment. adjustPoisonedPageOf is the only
+// writer; it is declared here and defined with the rest.
+//
+// A page is poisoned for segment S exactly when it has a mapping point in S and
+// `active` is non-null and not S. The count therefore changes in three places:
+// `active` flips (markPagesActive / clearPagesActive), a point is added while
+// the page is held, or a point is dropped while the page is held.
+//
+// Applies to every point of the page except the one in `active`. Several points
+// of one handle never share a segment (mapDonorHandle asserts it), so a point
+// is a page.
+inline void adjustPoisonedPageOf(ExpandableSegment* seg, bool poison);
+inline void adjustPoisonedPagesExcept(
+    const PhysicalHandleLedger& ledger,
+    ExpandableSegment* except,
+    bool poison);
+inline bool isAliasExpandableSegment(const ExpandableSegment* seg);
+
+inline void dropAliasLedgerPoint(
+    BlockPool& pool,
+    PhysicalHandleKey handle,
+    ExpandableSegment* seg,
+    size_t index) {
+  auto it = pool.aliased_handles_.find(handle);
+  if (it == pool.aliased_handles_.end()) {
+    LOG(WARNING)
+        << "expandable_segments_idle_remap: dropping an alias mapping point for a"
+        << " physical page the ledger does not know about";
+    return;
+  }
+  auto& points = it->second.points;
+  const size_t before_size = points.size();
+  for (size_t j = 0; j < points.size(); ++j) {
+    if (points[j].seg == seg && points[j].index == index) {
+      // The position being dropped must not be the view that owns the page.
+      TORCH_INTERNAL_ASSERT(
+          it->second.active != seg,
+          "dropping the mapping point that still holds the page active");
+      // A page held by another view was poisoned for this segment; it leaves
+      // this segment with the point.
+      if (it->second.active != nullptr) {
+        adjustPoisonedPageOf(seg, /*poison=*/false);
+      }
+      points.erase(points.begin() + static_cast<std::ptrdiff_t>(j));
+      break;
+    }
+  }
+  // Down to the home alone, the page is either wholly idle or held by the
+  // home's own view -- no other view can reach it any more.
+  TORCH_INTERNAL_ASSERT(
+      points.size() != 1 || it->second.active == nullptr ||
+          it->second.active == points[0].seg,
+      "a single remaining mapping point disagrees with the active view");
+  // Log before erasing the entry: `points` is a reference into it.
+  VLOG(1) << "expandable_segments_idle_remap: dropped an alias mapping point, "
+          << before_size << " -> " << points.size() << " points remain";
+  if (points.empty()) {
+    pool.aliased_handles_.erase(it);
+  }
+}
+
+inline void addAliasLedgerPoint(
+    BlockPool& pool,
+    PhysicalHandleKey handle,
+    ExpandableSegment* seg,
+    size_t index) {
+  auto& ledger = pool.aliased_handles_[handle];
+  ledger.points.push_back(AliasMapPoint{seg, index});
+  // A page already held by a view other than `seg` is poisoned for it from the
+  // moment it is mapped there.
+  if (ledger.active != nullptr && ledger.active != seg) {
+    adjustPoisonedPageOf(seg, /*poison=*/true);
+  }
+}
+
+inline bool aliasLedgerHasSegment(
+    BlockPool& pool,
+    PhysicalHandleKey handle,
+    ExpandableSegment* seg) {
+  auto it = pool.aliased_handles_.find(handle);
+  if (it == pool.aliased_handles_.end()) {
+    return false;
+  }
+  for (const auto& point : it->second.points) {
+    if (point.seg == seg) {
+      return true;
+    }
+  }
+  return false;
+}
+
+inline size_t aliasMapCountRemaining(
+    BlockPool& pool,
+    PhysicalHandleKey handle) {
+  auto it = pool.aliased_handles_.find(handle);
+  return it == pool.aliased_handles_.end() ? 0 : it->second.points.size();
+}
+
+// Records the donor page's base-segment mapping point so the refcount gate
+// counts it. Idempotent: a page donated to several aliases keeps one home
+// entry.
+inline void ensureAliasHomePoint(
+    BlockPool& pool,
+    PhysicalHandleKey handle,
+    ExpandableSegment* home_seg,
+    size_t index) {
+  if (aliasLedgerHasSegment(pool, handle, home_seg)) {
+    return;
+  }
+  auto& ledger = pool.aliased_handles_[handle];
+  // points[0] is the base-segment home by convention. The home point is
+  // registered only after the alias mapping succeeded, so insert at the front
+  // instead of appending.
+  ledger.points.insert(ledger.points.begin(), AliasMapPoint{home_seg, index});
+  if (ledger.active != nullptr && ledger.active != home_seg) {
+    adjustPoisonedPageOf(home_seg, /*poison=*/true);
+  }
+}
+
+// Drops the ledger entry for a handle that is no longer aliased. One remaining
+// point in a base segment means the page is back to a single mapping, i.e. an
+// ordinary base-segment page: only pages with two or more mappings belong in
+// the ledger, so that the steady state is empty and the
+// aliased_handles_.empty() fast paths stay effective.
+inline void pruneAliasLedgerEntry(BlockPool& pool, PhysicalHandleKey handle) {
+  auto it = pool.aliased_handles_.find(handle);
+  if (it == pool.aliased_handles_.end()) {
+    return;
+  }
+  const auto& points = it->second.points;
+  if (points.size() > 1) {
+    return;
+  }
+  if (points.size() == 1 && isAliasExpandableSegment(points[0].seg)) {
+    return;
+  }
+  pool.aliased_handles_.erase(it);
+}
+
+// True when the ledger still records a mapping point in `seg`. Used by the cold
+// paths that delete a segment to assert the teardown dropped every point.
+inline bool aliasLedgerHasAnyPointOf(
+    const BlockPool& pool,
+    const ExpandableSegment* seg) {
+  for (const auto& entry : pool.aliased_handles_) {
+    for (const auto& point : entry.second.points) {
+      if (point.seg == seg) {
+        return true;
+      }
+    }
+  }
+  return false;
+}
+
+// Reports whether any view currently holds a live allocation on this physical
+// page. A page that has never been aliased has no ledger entry and is therefore
+// idle by definition.
+inline bool ledgerActive(BlockPool* pool, PhysicalHandleKey handle) {
+  auto it = pool->aliased_handles_.find(handle);
+  if (it == pool->aliased_handles_.end()) {
+    return false;
+  }
+  return it->second.active != nullptr;
 }
 
 struct SegmentRange {
@@ -581,6 +804,144 @@ struct ExpandableSegment {
   ExpandableSegment operator=(const ExpandableSegment&) = delete;
   ExpandableSegment operator=(ExpandableSegment&&) = delete;
 
+  // Tag for the constructor that leaves the address reservation to the caller.
+  struct DeferReserve {};
+
+  // Reserves exactly `max_handles` pages, unlike the ordinary constructor's
+  // device-memory-derived reservation: an alias segment is stitched together
+  // once for a single request and never grown afterwards, so headroom past the
+  // request is dead address space.
+  ExpandableSegment(
+      DeferReserve,
+      c10::DeviceIndex device,
+      std::optional<cudaStream_t> stream,
+      size_t segment_size,
+      std::vector<c10::DeviceIndex> peers,
+      size_t max_handles)
+      : device_(device),
+        stream_(stream),
+        segment_size_(segment_size),
+        mapped_size_(0),
+        max_handles_(max_handles),
+        peers_(std::move(peers)) {
+    TORCH_INTERNAL_ASSERT(max_handles > 0);
+  }
+
+  // Creates an alias segment: address space whose pages will be second
+  // mappings of physical homed in base segments. The ordinary constructor
+  // routes the reservation through C10_CUDA_DRIVER_CHECK, so a caller that
+  // wants to fall back when the driver is out of address space cannot use it.
+  // On failure the segment is destroyed and `*out` says whether the driver
+  // refused the reservation (fall back) or something else went wrong (raise).
+  static ExpandableSegment* tryCreateAlias(
+      c10::DeviceIndex device,
+      std::optional<cudaStream_t> stream,
+      size_t segment_size,
+      std::vector<c10::DeviceIndex> peers,
+      size_t max_handles,
+      AliasReserveResult* out) {
+    auto* segment = new (std::nothrow) ExpandableSegment(
+        DeferReserve{},
+        device,
+        stream,
+        segment_size,
+        std::move(peers),
+        max_handles);
+    if (segment == nullptr) {
+      *out = AliasReserveResult::kOutOfAddressSpace;
+      return nullptr;
+    }
+#ifdef USE_ROCM
+    auto status =
+        hipMemAddressReserve(&segment->ptr_, segment->size(), 0ULL, 0, 0ULL);
+    const bool ok = status == hipSuccess;
+    const bool out_of_space = !ok && status == hipErrorOutOfMemory;
+    if (!ok) {
+      // hipMemAddressReserve treats the failure like a sticky runtime error.
+      // Clear it on every failure, including the out-of-space one: that branch
+      // returns so the caller can fall back to the base-segment path, and
+      // alloc_block's defensive cudaGetLastError() would otherwise turn the
+      // fallback into a bogus OOM.
+      (void)hipGetLastError();
+    }
+#else
+    auto status = DriverAPI::get()->cuMemAddressReserve_(
+        &segment->ptr_, segment->size(), 0ULL, 0, 0ULL);
+    const bool ok = status == CUDA_SUCCESS;
+    const bool out_of_space = !ok && status == CUDA_ERROR_OUT_OF_MEMORY;
+#endif
+    if (!ok) {
+      // ptr_ stayed 0, so the destructor skips cuMemAddressFree and the gauge
+      // decrement.
+      segment->ptr_ = 0;
+      delete segment;
+      *out = out_of_space ? AliasReserveResult::kOutOfAddressSpace
+                          : AliasReserveResult::kError;
+      return nullptr;
+    }
+    g_expandable_segments_reserved_bytes.fetch_add(
+        segment->size(), std::memory_order_relaxed);
+    g_expandable_segments_count.fetch_add(1, std::memory_order_relaxed);
+    segment->is_alias_segment_ = true;
+    *out = AliasReserveResult::kSuccess;
+    return segment;
+  }
+
+  // Second mapping of a physical page whose home is a base segment. Goes
+  // through neither map() nor mapAndSetAccess(): those create the physical
+  // (cuMemCreate) and would make this a first mapping, which is exactly what an
+  // alias segment must never hold.
+  bool mapDonorHandle(
+      size_t index,
+      PhysicalHandleKey handle_key,
+      BlockPool* pool) {
+    // Caller must size the alias segment to cover every donor it maps; an
+    // out-of-range index is a logic error, not a resource shortage.
+    TORCH_INTERNAL_ASSERT(
+        index < max_handles_, "mapDonorHandle index out of range");
+    while (handles_.size() <= index) {
+      handles_.emplace_back(std::nullopt);
+    }
+    TORCH_INTERNAL_ASSERT(!handles_.at(index));
+    // A handle must never be mapped twice into the same segment: unmapHandles
+    // walks positions independently and would dispose of it twice.
+    TORCH_INTERNAL_ASSERT(
+        !aliasLedgerHasSegment(*pool, handle_key, this),
+        "donor handle already mapped into this alias segment");
+    const auto handle = static_cast<CUmemGenericAllocationHandle>(handle_key);
+#ifdef USE_ROCM
+    auto status = hipMemMap(
+        ptr() + index * segment_size_, segment_size_, 0, handle, 0ULL);
+#else
+    auto status = DriverAPI::get()->cuMemMap_(
+        ptr_ + index * segment_size_, segment_size_, 0, handle, 0ULL);
+#endif
+    if (status != CUDA_SUCCESS) {
+      LOG(ERROR)
+          << "expandable_segments_idle_remap: mapping a donor page failed at "
+          << "index " << index << " of alias segment " << ptr()
+          << " (driver status " << static_cast<int>(status) << ")";
+#ifdef USE_ROCM
+      // hipMemMap treats the failure like a sticky runtime error, which the
+      // caller's fallback to the base-segment path must not inherit:
+      // alloc_block starts with a defensive cudaGetLastError(). The CUDA driver
+      // API leaves no sticky runtime error, so there is nothing to clear there.
+      (void)hipGetLastError();
+#endif
+      return false;
+    }
+    // Access for this device and every peer, exactly as mapAndSetAccess does:
+    // cuMemSetAccess is per address range, so the alias range needs its own.
+    handles_.at(index) = Handle{.handle = handle, .mapped = true};
+    mapped_size_ += segment_size_;
+    setAccess(device_, index, index + 1);
+    for (auto p : peers_) {
+      setAccess(p, index, index + 1);
+    }
+    addAliasLedgerPoint(*pool, handle_key, this, index);
+    return true;
+  }
+
   // begin must be aligned to segment_size_.
   // returns the actual range mapped, which may be
   // greater than requested if size is not aligned to segment_size_.
@@ -672,6 +1033,12 @@ struct ExpandableSegment {
         C10_CUDA_DRIVER_CHECK(status);
 #endif
       }
+      // handleAt() reports "no physical here" as 0, and the alias ledger keys
+      // on that value, so a real handle must never be 0. CUDA does not document
+      // 0 as invalid; fail loudly here rather than let an aliased page silently
+      // skip every ownership check.
+      TORCH_INTERNAL_ASSERT(
+          handle != 0, "cuMemCreate returned a zero allocation handle");
       handles_.at(i) = Handle{.handle = handle};
     }
     mapAndSetAccess(begin, end);
@@ -931,6 +1298,71 @@ struct ExpandableSegment {
     return segment_size_;
   }
 
+  // True for a segment built by tryCreateAlias: its pages are second mappings
+  // of physical homed in base segments, so it owns no physical of its own and
+  // contributes nothing to reserved_bytes / total_allocated_memory.
+  bool isAliasSegment() const {
+    return is_alias_segment_;
+  }
+
+  size_t handleCount() const {
+    return handles_.size();
+  }
+
+  // Number of pages mapped here whose physical is held active by a different
+  // segment's view, i.e. the pages pageUsableBy() rejects for this segment.
+  // Maintained by the ledger helpers; zero lets the page-aware checks skip
+  // their per-page ledger lookups for this segment.
+  size_t poisonedPages() const {
+    return poisoned_pages_;
+  }
+
+  void addPoisonedPages(size_t n) {
+    poisoned_pages_ += n;
+  }
+
+  void subPoisonedPages(size_t n) {
+    TORCH_INTERNAL_ASSERT(
+        poisoned_pages_ >= n, "poisoned page count underflow");
+    poisoned_pages_ -= n;
+  }
+
+  PhysicalHandleKey handleAt(size_t index) const {
+    if (index >= handles_.size() || !handles_[index]) {
+      return 0;
+    }
+    return static_cast<PhysicalHandleKey>(handles_[index]->handle);
+  }
+
+  void clearHandle(size_t index) {
+    if (index < handles_.size()) {
+      handles_[index] = std::nullopt;
+    }
+  }
+
+  size_t segmentLeft(char* p) const {
+    auto size = p - ptr();
+    return static_cast<size_t>(size) / segment_size_;
+  }
+
+  size_t segmentRight(char* p) const {
+    auto size = p - ptr();
+    return numSegments(size);
+  }
+
+  // Set once, right after construction, for allocator-owned segments only
+  // (never for fromShared() IPC imports, whose destructor must not touch any
+  // pool's alias ledger).
+  void setOwningPool(BlockPool* pool) {
+    pool_ = pool;
+  }
+
+  // Null for segments that no BlockPool owns (fromShared() IPC imports). Such a
+  // segment cannot consult the alias ledger, so it must never donate a page.
+  BlockPool* owningPool() const {
+    return pool_;
+  }
+
   // Mirrors the handle type map() requests and share() reports.
   Expandable_Segments_Handle_Type getHandleType() const {
     if (!ipcEnabled()) {
@@ -970,8 +1402,16 @@ struct ExpandableSegment {
   }
 
   ~ExpandableSegment() {
+    // An alias segment holds no physical of its own: every page it maps is
+    // homed in a base segment, so disposeHandleAt releases nothing while
+    // another mapping point remains. Otherwise this is the baseline teardown.
     forEachAllocatedRange(
         [&](size_t begin, size_t end) { unmapHandles(begin, end); });
+    // tryCreateAlias destroys the segment when the reservation failed, leaving
+    // ptr_ at 0 and the gauges untouched.
+    if (ptr_ == 0) {
+      return;
+    }
 #ifdef USE_ROCM
     C10_CUDA_CHECK(hipMemAddressFree(ptr_, segment_size_ * max_handles_));
 #else
@@ -1049,6 +1489,57 @@ struct ExpandableSegment {
     }
   }
 
+  // Drops this segment's mapping point for the page at `i` and reports whether
+  // that was its last mapping. True for every page that was never aliased (no
+  // ledger entry), so the ordinary path is unchanged.
+  bool dropsLastMappingOf(PhysicalHandleKey handle, size_t i) {
+    if (pool_ == nullptr || pool_->aliased_handles_.empty() ||
+        pool_->aliased_handles_.count(handle) == 0) {
+      return true;
+    }
+    dropAliasLedgerPoint(*pool_, handle, this, i);
+    if (aliasMapCountRemaining(*pool_, handle) == 0) {
+      return true;
+    }
+    pruneAliasLedgerEntry(*pool_, handle);
+    return false;
+  }
+
+  void disposeHandleAt(size_t i) {
+    auto& maybe_handle = handles_.at(i);
+    TORCH_INTERNAL_ASSERT(maybe_handle.has_value());
+    Handle h = *maybe_handle;
+    maybe_handle = std::nullopt;
+    if (h.mapped) {
+#ifdef USE_ROCM
+      C10_CUDA_CHECK(hipMemUnmap(ptr() + segment_size_ * i, segment_size_));
+#else
+      C10_CUDA_DRIVER_CHECK(
+          DriverAPI::get()->cuMemUnmap_(
+              ptr_ + segment_size_ * i, segment_size_));
+#endif
+    }
+    if (h.shareable_handle) {
+#ifndef _WIN32
+      // shareable_handle also holds CUmemFabricHandle for fabric segments;
+      // std::get_if skips those (no fd to close) instead of throwing.
+      if (auto* fd = std::get_if<int>(&*h.shareable_handle)) {
+        close(*fd);
+      }
+#endif
+    }
+    // Another segment still maps this physical page, so it is not ours to
+    // release: whoever drops the last mapping point disposes of it.
+    if (!dropsLastMappingOf(static_cast<PhysicalHandleKey>(h.handle), i)) {
+      return;
+    }
+#ifdef USE_ROCM
+    C10_CUDA_CHECK(hipMemRelease(h.handle));
+#else
+    C10_CUDA_DRIVER_CHECK(DriverAPI::get()->cuMemRelease_(h.handle));
+#endif
+  }
+
   void unmapHandles(size_t begin, size_t end) {
     // note: unlike cudaFree, MemUnmap and MemRelease do
     // not appear to synchronize in all cases, so we have to wait for the
@@ -1064,32 +1555,7 @@ struct ExpandableSegment {
       C10_CUDA_CHECK(cudaDeviceSynchronize());
     }
     for (auto i : c10::irange(begin, end)) {
-      auto& maybe_handle = handles_.at(i);
-      TORCH_INTERNAL_ASSERT(maybe_handle.has_value());
-      Handle h = *maybe_handle;
-      maybe_handle = std::nullopt;
-      if (h.mapped) {
-#ifdef USE_ROCM
-        C10_CUDA_CHECK(hipMemUnmap(ptr() + segment_size_ * i, segment_size_));
-#else
-        C10_CUDA_DRIVER_CHECK(DriverAPI::get()->cuMemUnmap_(
-            ptr_ + segment_size_ * i, segment_size_));
-#endif
-      }
-      if (h.shareable_handle) {
-#ifndef _WIN32
-        // shareable_handle also holds CUmemFabricHandle for fabric segments;
-        // std::get_if skips those (no fd to close) instead of throwing.
-        if (auto* fd = std::get_if<int>(&*h.shareable_handle)) {
-          close(*fd);
-        }
-#endif
-      }
-#ifdef USE_ROCM
-      C10_CUDA_CHECK(hipMemRelease(h.handle));
-#else
-      C10_CUDA_DRIVER_CHECK(DriverAPI::get()->cuMemRelease_(h.handle));
-#endif
+      disposeHandleAt(i);
     }
     trimHandles();
   }
@@ -1110,16 +1576,8 @@ struct ExpandableSegment {
       }
     }
   }
-  size_t numSegments(size_t size) {
+  size_t numSegments(size_t size) const {
     return (size + segment_size_ - 1) / segment_size_;
-  }
-  size_t segmentLeft(char* p) {
-    auto size = p - ptr();
-    return size / segment_size_;
-  }
-  size_t segmentRight(char* p) {
-    auto size = p - ptr();
-    return numSegments(size);
   }
   SegmentRange rangeFromHandles(size_t begin, size_t end) {
     return SegmentRange(
@@ -1154,6 +1612,14 @@ struct ExpandableSegment {
   // devices on which this memory should be mapped in addition
   // to the device where the physical memory lives (device_).
   std::vector<c10::DeviceIndex> peers_;
+  // Owning BlockPool, consulted before disposing of physical so a page another
+  // segment still maps survives. Set only for allocator-owned segments
+  // (find_expandable_block, tryCreateAlias); left null for fromShared() IPC
+  // imports, whose destructor must not touch any pool's alias ledger.
+  BlockPool* pool_{nullptr};
+  bool is_alias_segment_{false};
+  // See poisonedPages().
+  size_t poisoned_pages_{0};
 };
 #else
 struct ExpandableSegment {
@@ -1205,8 +1671,420 @@ struct ExpandableSegment {
     return Expandable_Segments_Handle_Type::UNSPECIFIED;
   }
   void addPeer(c10::DeviceIndex device) {}
+
+  // Alias support. Unreachable here: expandable_segments() is false on this
+  // platform, so alias_fill_allowed() never lets the alias paths run. They
+  // exist so the shared ledger helpers below compile against either segment.
+  static ExpandableSegment* tryCreateAlias(
+      c10::DeviceIndex device,
+      std::optional<cudaStream_t> stream,
+      size_t segment_size,
+      std::vector<c10::DeviceIndex> peers,
+      size_t max_handles,
+      AliasReserveResult* out) {
+    *out = AliasReserveResult::kError;
+    return nullptr;
+  }
+  bool mapDonorHandle(size_t index, PhysicalHandleKey handle, BlockPool* pool) {
+    return false;
+  }
+  bool isAliasSegment() const {
+    return false;
+  }
+  size_t handleCount() const {
+    return 0;
+  }
+  size_t poisonedPages() const {
+    return 0;
+  }
+  void addPoisonedPages(size_t n) {}
+  void subPoisonedPages(size_t n) {}
+  PhysicalHandleKey handleAt(size_t index) const {
+    return 0;
+  }
+  void clearHandle(size_t index) {}
+  size_t segmentLeft(char* p) const {
+    return 0;
+  }
+  size_t segmentRight(char* p) const {
+    return 0;
+  }
+  void setOwningPool(BlockPool* pool) {}
+  BlockPool* owningPool() const {
+    return nullptr;
+  }
 };
 #endif
+
+// Alias ledger helpers that reach into an ExpandableSegment, so they follow
+// both segment definitions above. Every one of them short-circuits while
+// `aliased_handles_` is empty, which is the steady state when
+// expandable_segments_idle_remap is off: the feature then costs one predictable
+// branch on the allocation and free paths.
+
+inline bool isAliasExpandableSegment(const ExpandableSegment* seg) {
+  return seg != nullptr && seg->isAliasSegment();
+}
+
+inline void adjustPoisonedPageOf(ExpandableSegment* seg, bool poison) {
+  if (poison) {
+    seg->addPoisonedPages(1);
+  } else {
+    seg->subPoisonedPages(1);
+  }
+}
+
+inline void adjustPoisonedPagesExcept(
+    const PhysicalHandleLedger& ledger,
+    ExpandableSegment* except,
+    bool poison) {
+  for (const AliasMapPoint& point : ledger.points) {
+    if (point.seg != except) {
+      adjustPoisonedPageOf(point.seg, poison);
+    }
+  }
+}
+
+// A page is usable by `seg`'s view when nobody holds it, or when `seg` itself
+// is the holder (the same view may carve several blocks out of one page). It is
+// poisoned for `seg` only while a *different* segment's view owns it.
+inline bool pageUsableBy(
+    BlockPool* pool,
+    PhysicalHandleKey handle,
+    ExpandableSegment* seg) {
+  auto it = pool->aliased_handles_.find(handle);
+  if (it == pool->aliased_handles_.end()) {
+    return true;
+  }
+  ExpandableSegment* active = it->second.active;
+  return active == nullptr || active == seg;
+}
+
+// Marks every physical page the range touches as owned by `seg`'s view. A page
+// counts as touched when it overlaps the range at all, not only when fully
+// covered: a block may be handed out covering just part of a page, and the rest
+// of that page must not then be served to another view.
+inline void markPagesActive(
+    BlockPool* pool,
+    ExpandableSegment* seg,
+    char* ptr,
+    size_t size) {
+  if (size == 0 || pool->aliased_handles_.empty()) {
+    // No handle has ever been aliased, so no page can be reached through a
+    // second view and there is nothing to arbitrate.
+    return;
+  }
+  size_t begin = seg->segmentLeft(ptr);
+  size_t end = seg->segmentRight(ptr + size);
+  for (size_t i = begin; i < end && i < seg->handleCount(); ++i) {
+    PhysicalHandleKey handle = seg->handleAt(i);
+    if (handle == 0) {
+      continue;
+    }
+    auto it = pool->aliased_handles_.find(handle);
+    if (it == pool->aliased_handles_.end()) {
+      // Never aliased: no ledger entry means no other view can reach this page,
+      // so there is nothing to arbitrate.
+      continue;
+    }
+    TORCH_INTERNAL_ASSERT(
+        it->second.active == nullptr || it->second.active == seg,
+        "physical page handed to two different segment views");
+    if (it->second.active == nullptr) {
+      // Idle -> held by `seg`: the page becomes poisoned for every other view
+      // that maps it.
+      adjustPoisonedPagesExcept(it->second, seg, /*poison=*/true);
+    }
+    it->second.active = seg;
+  }
+}
+
+// Releases pages the range covers back to idle, but only those the owning view
+// no longer occupies at all. Clearing is deliberately asymmetric with marking:
+// a page is marked when merely touched, yet only cleared once the whole page is
+// contained in free+mapped space, so a partially-freed page stays owned.
+//
+// `freed` is already merged with its free neighbours, so its extent is the
+// view's whole free space here -- but only the pages the block being released
+// actually touched can have changed state, so the walk is clipped to [raw_ptr,
+// raw_ptr + raw_size), the block's extent before that merge.
+//
+// Why the pages outside that range cannot need clearing: a page is marked when
+// a block merely touches it and cleared only once wholly inside free space, so
+// a page still held by `seg` has a live allocation overlapping it. The release
+// that finally makes it clearable is the release of the last such allocation,
+// whose own extent overlaps the page -- that is this walk's range at that call.
+// A page wholly inside the merged extent but untouched by this block was
+// therefore already cleared by whichever release last covered it.
+inline void clearPagesActive(
+    BlockPool* pool,
+    ExpandableSegment* seg,
+    Block* freed,
+    void* raw_ptr,
+    size_t raw_size) {
+  if (freed->size == 0 || raw_size == 0 || pool->aliased_handles_.empty()) {
+    return;
+  }
+  char* lo = static_cast<char*>(freed->ptr);
+  char* hi = lo + freed->size;
+  char* raw_lo = static_cast<char*>(raw_ptr);
+  char* raw_hi = raw_lo + raw_size;
+  // Pages wholly inside the merged extent, intersected with the pages the
+  // released block touched (segmentLeft/segmentRight swap roles here: touching
+  // a page at all is enough to have marked it).
+  size_t begin = std::max(seg->segmentRight(lo), seg->segmentLeft(raw_lo));
+  size_t end = std::min(seg->segmentLeft(hi), seg->segmentRight(raw_hi));
+  for (size_t i = begin; i < end && i < seg->handleCount(); ++i) {
+    PhysicalHandleKey handle = seg->handleAt(i);
+    if (handle == 0) {
+      continue;
+    }
+    auto it = pool->aliased_handles_.find(handle);
+    if (it == pool->aliased_handles_.end()) {
+      continue;
+    }
+    if (it->second.active == seg) {
+      // Held by `seg` -> idle: the page is no longer poisoned for the others.
+      adjustPoisonedPagesExcept(it->second, seg, /*poison=*/false);
+      it->second.active = nullptr;
+    }
+  }
+}
+
+// One physical page can be mapped into several segments, but only one segment
+// can use it at a time.
+inline bool blockPagesUsable(BlockPool* pool, Block* block, size_t size) {
+  ExpandableSegment* seg = block->expandable_segment_;
+  if (!seg || size == 0) {
+    return true;
+  }
+  if (pool->aliased_handles_.empty() || seg->poisonedPages() == 0) {
+    return true;
+  }
+  char* lo = static_cast<char*>(block->ptr);
+  size_t begin = seg->segmentLeft(lo);
+  size_t end = seg->segmentRight(lo + std::min(size, block->size));
+  for (size_t i = begin; i < end && i < seg->handleCount(); ++i) {
+    PhysicalHandleKey handle = seg->handleAt(i);
+    if (handle == 0) {
+      continue;
+    }
+    if (!pageUsableBy(pool, handle, seg)) {
+      return false;
+    }
+  }
+  return true;
+}
+
+inline bool blockHasDonatedPage(BlockPool* pool, Block* block) {
+  ExpandableSegment* seg = block->expandable_segment_;
+  if (!seg || pool->aliased_handles_.empty()) {
+    return false;
+  }
+  char* lo = static_cast<char*>(block->ptr);
+  size_t begin = seg->segmentRight(lo);
+  size_t end = seg->segmentLeft(lo + block->size);
+  for (size_t i = begin; i < end && i < seg->handleCount(); ++i) {
+    PhysicalHandleKey handle = seg->handleAt(i);
+    if (handle == 0) {
+      continue;
+    }
+    if (aliasMapCountRemaining(*pool, handle) > 1) {
+      return true;
+    }
+  }
+  return false;
+}
+
+// A contiguous byte range of a block that touches no poisoned page: every page
+// it touches is usable by the block's own segment view (pageUsableBy).
+struct UsableRange {
+  char* ptr;
+  size_t size;
+};
+
+// Finds the smallest range of at least `size` bytes within `block` that rests
+// only on pages the block's own view may use, taking the lowest address on
+// ties. Returns a zero-size range if none is long enough.
+inline UsableRange findBestFitUsableRange(
+    BlockPool* pool,
+    Block* block,
+    size_t size) {
+  char* lo = static_cast<char*>(block->ptr);
+  ExpandableSegment* seg = block->expandable_segment_;
+  // No page of this segment is held by another view, so the whole block is one
+  // clean range and there is nothing to look up page by page.
+  if (!seg || pool->aliased_handles_.empty() || seg->poisonedPages() == 0) {
+    return {lo, block->size};
+  }
+  char* hi = lo + block->size;
+  size_t begin = seg->segmentLeft(lo);
+  size_t end = seg->segmentRight(hi);
+  const size_t segment_size = seg->getSegmentSize();
+
+  UsableRange best{lo, 0};
+  char* range_start = nullptr;
+  char* range_end = nullptr;
+  auto close_range = [&]() {
+    if (range_start) {
+      size_t range_size = static_cast<size_t>(range_end - range_start);
+      if (range_size >= size && (best.size == 0 || range_size < best.size)) {
+        best = {range_start, range_size};
+      }
+      range_start = nullptr;
+    }
+  };
+  for (size_t i = begin; i < end; ++i) {
+    // The first and last page of a block are usually only partly covered by it,
+    // so clip each page's extent to the block.
+    char* page_lo = std::max(lo, seg->ptr() + i * segment_size);
+    char* page_hi = std::min(hi, seg->ptr() + (i + 1) * segment_size);
+
+    PhysicalHandleKey handle =
+        (i < seg->handleCount()) ? seg->handleAt(i) : PhysicalHandleKey{0};
+    // An unmapped page carries no physical and thus no ledger entry, so no
+    // other view can be reaching it.
+    bool usable = handle == 0 || pageUsableBy(pool, handle, seg);
+
+    if (!usable) {
+      close_range();
+      continue;
+    }
+    if (!range_start) {
+      range_start = page_lo;
+    }
+    range_end = page_hi;
+  }
+  close_range();
+  return best;
+}
+
+// Confines `block` to `range`, returning the bytes on either side to the pool
+// as free blocks, so the block rests only on pages its own view may use. The
+// caller must have erased `block` from the pool first: this mutates ptr/size,
+// which are part of both ordering keys. Returns false if a surrounding block
+// could not be allocated, in which case `block` is left untouched.
+inline bool confineBlockToRange(
+    BlockPool& pool,
+    Block* block,
+    const UsableRange& range) {
+  char* block_lo = static_cast<char*>(block->ptr);
+  char* block_hi = block_lo + block->size;
+  char* range_hi = range.ptr + range.size;
+  size_t front = static_cast<size_t>(range.ptr - block_lo);
+  size_t back = static_cast<size_t>(block_hi - range_hi);
+
+  // Allocate both pieces up front: committing to one and then failing on the
+  // other would leave the block half-carved.
+  Block* front_block = nullptr;
+  Block* back_block = nullptr;
+  if (front > 0) {
+    front_block = new (std::nothrow)
+        Block(block->device, block->stream, front, block->pool, block_lo);
+    if (!front_block) {
+      LOG(ERROR)
+          << "expandable_segments_idle_remap: failed to allocate the Block "
+          << "for a poisoned prefix";
+      return false;
+    }
+  }
+  if (back > 0) {
+    back_block = new (std::nothrow)
+        Block(block->device, block->stream, back, block->pool, range_hi);
+    if (!back_block) {
+      LOG(ERROR)
+          << "expandable_segments_idle_remap: failed to allocate the Block "
+          << "for a poisoned suffix";
+      delete front_block;
+      return false;
+    }
+  }
+
+  if (front_block) {
+    front_block->expandable_segment_ = block->expandable_segment_;
+    front_block->registration_counter = block->registration_counter;
+    front_block->splice(block->prev, block);
+    pool.insert_into_blocks(front_block);
+    block->ptr = range.ptr;
+    block->size -= front;
+  }
+  if (back_block) {
+    back_block->expandable_segment_ = block->expandable_segment_;
+    back_block->registration_counter = block->registration_counter;
+    back_block->splice(block, block->next);
+    pool.insert_into_blocks(back_block);
+    block->size -= back;
+  }
+  return true;
+}
+
+// Idle physical pages of `pool` on `stream` that an alias segment could map,
+// walking the free blocks from the largest down. Stops at `need_pages`.
+inline c10::SmallVector<DonorPage, 8> collectDonors(
+    BlockPool* pool,
+    cudaStream_t stream,
+    c10::DeviceIndex device,
+    size_t need_pages,
+    size_t segment_size) {
+  c10::SmallVector<DonorPage, 8> donors;
+  Block key(device, stream, SIZE_MAX, nullptr, nullptr);
+  auto it = pool->blocks.upper_bound(&key);
+  while (it != pool->blocks.begin()) {
+    --it;
+    Block* b = *it;
+    // pool.blocks is ordered by stream first, so this ends the stream's run.
+    if (b->stream != stream) {
+      break;
+    }
+    if (b->allocated) {
+      continue; // Only collect from free blocks
+    }
+    if (!b->mapped) {
+      continue; // An unmapped block has no physical pages
+    }
+    if (!b->expandable_segment_) {
+      continue;
+    }
+    ExpandableSegment* seg = b->expandable_segment_;
+    if (seg->isAliasSegment()) {
+      // Alias segments hold no physical of their own; their pages are extra
+      // mappings whose home lives in a base segment.
+      continue;
+    }
+    if (seg->owningPool() != pool) {
+      // A segment no pool owns cannot consult the alias ledger when it unmaps,
+      // so it would release a page an alias still maps. Never donate from one.
+      continue;
+    }
+    // Only collect from segments with matching segment_size to ensure geometric
+    // compatibility with the alias segment.
+    if (seg->getSegmentSize() != segment_size) {
+      continue;
+    }
+    char* block_start = static_cast<char*>(b->ptr);
+    char* block_end = block_start + b->size;
+
+    // Shrink to the page range this block fully covers (same logic as unmap's
+    // segmentRight/segmentLeft pair). Only fully-covered pages are candidates.
+    size_t start_idx = seg->segmentRight(block_start);
+    size_t end_idx = seg->segmentLeft(block_end);
+
+    for (size_t i = start_idx; i < end_idx && i < seg->handleCount(); ++i) {
+      PhysicalHandleKey h = seg->handleAt(i);
+      if (h == 0) {
+        continue;
+      }
+      if (ledgerActive(pool, h)) {
+        continue;
+      }
+      donors.emplace_back(seg, i, h);
+      if (donors.size() >= need_pages) {
+        return donors;
+      }
+    }
+  }
+  return donors;
+}
 
 // BlockState, BlockPoolState, and PrivatePoolState contain the information
 // needed to reconstruct a private pool to a previous state. See note
@@ -1663,6 +2541,12 @@ class DeviceCachingAllocator {
 
   // all live expandable segments
   std::vector<ExpandableSegment*> expandable_segments_;
+  // Live alias segments. Kept apart from expandable_segments_ on purpose: that
+  // vector drives base-segment teardown (release_expandable_segment) and the
+  // reserved_bytes accounting an alias range deliberately does not participate
+  // in. This one exists so addPeerAccess can still grant a newly added peer
+  // access to alias ranges that were reserved before it arrived.
+  std::vector<ExpandableSegment*> alias_segments_;
   std::vector<c10::DeviceIndex> devices_with_peer_access_;
 
   bool record_history = false;
@@ -1852,6 +2736,23 @@ class DeviceCachingAllocator {
       return nullptr;
     }
     Block* block = *it;
+    // An alias segment is never the target of a recorded address: alias
+    // segments are excluded from the snapshot, so no saved layout can name one.
+    // This process may still have reserved an alias range that happens to
+    // contain the requested address, and serving it would hand back memory
+    // whose physical is homed in a base segment and whose bytes were never
+    // credited to reserved_bytes.
+    //
+    // A base block is not automatically a valid target either: this path
+    // bypasses get_free_block's page-aware best fit, so it must apply the same
+    // ownership test itself. Serving a block whose pages another view holds
+    // would trip markPagesActive's "two different segment views" assert in
+    // alloc_found_block.
+    if (block->expandable_segment_ &&
+        (block->expandable_segment_->isAliasSegment() ||
+         !blockPagesUsable(block->pool, block, block->size))) {
+      return nullptr;
+    }
     const auto block_begin = reinterpret_cast<uintptr_t>(block->ptr);
     // check block_begin <= requested_addr < requested_addr + size <=
     // block_begin + block->size
@@ -2373,6 +3274,13 @@ class DeviceCachingAllocator {
       remaining->prev = block;
       remaining->ptr = static_cast<char*>(remaining->ptr) + size;
       remaining->size -= size;
+      // The page-aware confine in get_free_block may have left a free block
+      // right after `remaining`, which would leave two adjacent free blocks in
+      // the pool. Merge before inserting: ptr/size are the ordering keys of
+      // both sets.
+      if (C10_UNLIKELY(!pool->aliased_handles_.empty())) {
+        try_merge_blocks(remaining, remaining->next, *pool);
+      }
       // NOLINTNEXTLINE(clang-analyzer-deadcode.DeadStores)
       bool inserted = pool->insert_into_blocks(remaining).second;
       TORCH_INTERNAL_ASSERT_DEBUG_ONLY(inserted);
@@ -2403,6 +3311,16 @@ class DeviceCachingAllocator {
     block->capture_id = capture_tracker_.hasActiveCaptures()
         ? captureIdMayInitCtx(stream).value_or(0)
         : 0;
+    // Claim the physical pages this block occupies for its own segment view, so
+    // no other view (base home or another alias segment) can be handed the same
+    // page while this allocation is live. No-op unless the page is aliased.
+    if (block->expandable_segment_) {
+      markPagesActive(
+          pool,
+          block->expandable_segment_,
+          static_cast<char*>(block->ptr),
+          block->size);
+    }
 
     block->context_when_allocated = std::move(context);
     record_trace(
@@ -3252,6 +4170,16 @@ class DeviceCachingAllocator {
       if (head_block->prev && head_block->prev->mapped) {
         continue;
       }
+      // An alias segment's mapped pages are extra mappings of physical homed in
+      // a base segment; emitting a SegmentInfo for it would count that physical
+      // twice and read as memory growth that never happened. Keep it out of the
+      // segment list and total_active so occupancy accounting is unchanged. The
+      // filter belongs here, not in get_all_blocks(): other walkers of that
+      // function must still see alias blocks.
+      if (head_block->expandable_segment_ &&
+          head_block->expandable_segment_->isAliasSegment()) {
+        continue;
+      }
       result.emplace_back();
       SegmentInfo& segment_info = result.back();
       segment_info.device = head_block->device;
@@ -3565,6 +4493,16 @@ class DeviceCachingAllocator {
         devices_with_peer_access_.end()) {
       return;
     }
+    // Alias segments are deliberately not in expandable_segments_, so grant the
+    // new peer access to them here. cuMemSetAccess is per address range:
+    // without this, an allocation already living in an alias range would fault
+    // when the peer touches it. alias_fill_allowed() stops new alias segments
+    // appearing once a peer exists, so this is a one-time fixup of whatever was
+    // live. No idle-segment release here on purpose: that would synchronize the
+    // device under the allocator mutex from a path that never used to.
+    for (auto& as : alias_segments_) {
+      as->addPeer(dev_to_access);
+    }
     devices_with_peer_access_.push_back(dev_to_access);
     for (auto& es : expandable_segments_) {
       es->addPeer(dev_to_access);
@@ -3694,6 +4632,16 @@ class DeviceCachingAllocator {
           static_cast<int>(device_id),
           " has no fabric access here");
     }
+    // The reservation below is address-pinned and fails rather than landing
+    // elsewhere. Idle alias segments hold address space that no accounting
+    // claims, so hand it back first: an alias range sitting on the recorded
+    // address would otherwise make the restore fail in a process that has never
+    // allocated anything at it. A *live* alias segment cannot be released here
+    // and still makes the restore fail; empty_cache() after freeing it is the
+    // recovery.
+    for (Block* block : collect_idle_alias_segments(large_blocks)) {
+      release_alias_segment(block);
+    }
     expandable_segments_.emplace_back(new ExpandableSegment(
         device_id,
         stream,
@@ -3702,6 +4650,7 @@ class DeviceCachingAllocator {
         reserve_size / segment_size,
         address));
     ExpandableSegment* es = expandable_segments_.back();
+    es->setOwningPool(pool);
 
     Block* whole = new Block(device_id, stream, es->size(), pool, es->ptr());
     whole->mapped = false;
@@ -3858,9 +4807,13 @@ class DeviceCachingAllocator {
       size_t size) {
     Block key(device, stream, 0);
 
-    auto allocatable = [](Block* b) {
+    // A mapped block is only allocatable here if its pages are not owned by a
+    // different segment's view; otherwise expanding onto it would alias a page
+    // that is already serving a live allocation elsewhere.
+    auto allocatable = [pool](Block* b) {
       return b && !b->allocated && b->event_count == 0 &&
-          b->stream_uses.empty();
+          b->stream_uses.empty() &&
+          (!b->mapped || blockPagesUsable(pool, b, b->size));
     };
     auto has_available_address_space = [&](Block* b) {
       size_t bytes = 0;
@@ -3884,13 +4837,12 @@ class DeviceCachingAllocator {
         return c;
       }
     }
-    auto segment_size = pool->is_small
-        ? kSmallBuffer
-        : AcceleratorAllocatorConfig::large_segment_size();
+    auto segment_size = get_segment_size_for_pool(pool->is_small);
     expandable_segments_.emplace_back(new ExpandableSegment(
         device, stream, segment_size, devices_with_peer_access_));
 
     ExpandableSegment* es = expandable_segments_.back();
+    es->setOwningPool(pool);
     // A single allocation cannot span expandable segments, so if even a fresh
     // segment is smaller than `size` no segment can ever satisfy the request.
     // Report "no block" rather than returning a candidate that violates the
@@ -3948,8 +4900,19 @@ class DeviceCachingAllocator {
       to_map->size = mapped_range.size;
     }
 
-    try_merge_blocks(to_map, to_map->prev, pool);
-    try_merge_blocks(to_map, to_map->next, pool);
+    // Do not absorb a neighbour that rests on pages another segment's view
+    // owns. The merged block goes straight back to the caller without passing
+    // the page-aware best-fit checks, so swallowing such a neighbour would hand
+    // out physical that is already serving a live allocation through an alias.
+    auto mergeable = [&pool](Block* src) {
+      return src && (!src->mapped || blockPagesUsable(&pool, src, src->size));
+    };
+    if (mergeable(to_map->prev)) {
+      try_merge_blocks(to_map, to_map->prev, pool);
+    }
+    if (mergeable(to_map->next)) {
+      try_merge_blocks(to_map, to_map->next, pool);
+    }
 
     pool.insert_into_blocks(to_map);
 
@@ -4011,12 +4974,381 @@ class DeviceCachingAllocator {
     return tail;
   }
 
+  static size_t get_segment_size_for_pool(bool is_small_pool) {
+    return is_small_pool ? kSmallBuffer
+                         : AcceleratorAllocatorConfig::large_segment_size();
+  }
+
+  // Scope gate for the idle-remap alias fill path. Evaluated before any donor
+  // scan, so a disabled feature costs nothing on the page-fault path.
+  bool alias_fill_allowed(const BlockPool* pool) const {
+    if (!CUDAAllocatorConfig::expandable_segments() ||
+        !CUDAAllocatorConfig::expandable_segments_idle_remap()) {
+      return false;
+    }
+    // Large pool only: small-pool segments are 2MB with <=1MiB allocations, so
+    // the holes are small and stitching them is not worth the fragmentation.
+    if (pool->is_small) {
+      return false;
+    }
+    // CUDA graph private pools need stable addresses for capture, and the
+    // interaction between aliasing and cudaMalloc_count is unverified.
+    if (pool->owner_PrivatePool != nullptr) {
+      return false;
+    }
+    // With IPC handles enabled, a base segment's pages can be exported to
+    // another process at any time. An exported page that is also mapped into an
+    // alias VA cannot be described by share(), which walks one segment's
+    // handles and reports one range, so refuse to create the second mapping
+    // rather than let a later share() silently describe half of it.
+    if (ExpandableSegment::ipcEnabled()) {
+      TORCH_WARN_ONCE(
+          "expandable_segments_idle_remap is ignored because expandable segment "
+          "IPC handles are enabled; set TORCH_CUDA_EXPANDABLE_SEGMENTS_IPC=0 to "
+          "use it.")
+      return false;
+    }
+    // cuMemSetAccess is per address range, and addPeerAccess only walks
+    // expandable_segments_, which alias segments are deliberately not part of.
+    // A peer added after an alias segment exists would therefore not get access
+    // to the alias range. addPeerAccess drops the idle ones and this gate stops
+    // new ones; see also the peers handed to tryCreateAlias.
+    if (!devices_with_peer_access_.empty()) {
+      return false;
+    }
+    return true;
+  }
+
+  // Alias segments of `pool` that are fully idle: one free block covering the
+  // whole segment. Recomputed on each call -- the VA reclaim needs the set
+  // after it has dropped and retaken the lock.
+  std::vector<Block*> collect_idle_alias_segments(const BlockPool& pool) {
+    std::vector<Block*> idle;
+    if (C10_LIKELY(pool.aliased_handles_.empty())) {
+      return idle;
+    }
+    for (Block* block : pool.blocks) {
+      if (block->expandable_segment_ &&
+          block->expandable_segment_->isAliasSegment() && !block->allocated &&
+          block->event_count == 0 && block->stream_uses.empty() &&
+          !block->prev && !block->next) {
+        idle.push_back(block);
+      }
+    }
+    return idle;
+  }
+
+  // Unmaps a fully-idle alias segment and releases its VA. Reached from
+  // empty_cache, the OOM retry chain and restore_expandable_segment.
+  void release_alias_segment(Block* block) {
+    ExpandableSegment* seg = block->expandable_segment_;
+    TORCH_INTERNAL_ASSERT(seg && seg->isAliasSegment());
+    seg->unmap(SegmentRange{block->ptr, block->size});
+    // Same role as release_expandable_segment's !block->mapped assert: state
+    // the teardown invariant here, where throwing is safe, rather than in the
+    // destructor. Every position is unmapped, so no ledger point names this
+    // segment any more and its destructor has only the VA left to release.
+    TORCH_INTERNAL_ASSERT(
+        seg->handleCount() == 0 && !aliasLedgerHasAnyPointOf(*block->pool, seg),
+        "alias segment still mapped after unmap");
+    // No point names this segment, so it cannot have any page poisoned.
+    TORCH_INTERNAL_ASSERT(
+        seg->poisonedPages() == 0,
+        "alias segment unmapped with a non-zero poisoned page count");
+    block->pool->erase_from_blocks(block);
+    auto it = std::ranges::find(alias_segments_, seg);
+    TORCH_INTERNAL_ASSERT(it != alias_segments_.end());
+    alias_segments_.erase(it);
+    delete seg;
+    block->expandable_segment_ = nullptr;
+    delete block;
+  }
+
+  // Undoes the first `count` donor mappings of a freshly built alias segment.
+  // Goes through unmap() so the pages take the same path as any other teardown:
+  // disposeHandleAt drops this segment's ledger point, sees the base home still
+  // mapped, and therefore releases no physical.
+  void rollback_alias_mappings(
+      ExpandableSegment* alias_seg,
+      size_t count,
+      size_t segment_size) {
+    for (size_t i = 0; i < count; ++i) {
+      char* va = static_cast<char*>(alias_seg->ptr()) + i * segment_size;
+      alias_seg->unmap(SegmentRange{va, segment_size});
+    }
+  }
+
+  // Maps `pages` fresh physical pages into *base* segments and appends them to
+  // `donors`. Used when the idle donors do not cover the request. Asks for the
+  // whole remaining shortfall at once, so the normal layout -- unmapped VA
+  // being one large segment tail -- is covered by a single scan and a single
+  // map_block.
+  bool backfill_donor_pages(
+      c10::DeviceIndex device,
+      cudaStream_t stream,
+      BlockPool* pool,
+      size_t segment_size,
+      size_t pages,
+      const std::shared_ptr<GatheredContext>& ctx,
+      c10::SmallVector<DonorPage, 8>& donors) {
+    size_t filled = 0;
+    while (filled < pages) {
+      // Goes round again only when the run found was already partly mapped, or
+      // was shorter than the shortfall.
+      Block* candidate = find_expandable_block(
+          device, stream, pool, (pages - filled) * segment_size);
+      if (candidate == nullptr) {
+        return false;
+      }
+      if (candidate->mapped) {
+        candidate = candidate->next;
+        if (candidate == nullptr || candidate->mapped) {
+          return false;
+        }
+      }
+      ExpandableSegment* seg = candidate->expandable_segment_;
+      if (seg == nullptr || seg->isAliasSegment() ||
+          seg->getSegmentSize() != segment_size) {
+        return false;
+      }
+      // map_block maps from the block's own start, so take the page index
+      // before the call: afterwards the block may have been merged with a free
+      // neighbour and no longer begin there.
+      size_t index = seg->segmentLeft(static_cast<char*>(candidate->ptr));
+      // Unmapped blocks are always a whole number of pages: unmap() only
+      // releases whole pages and map_block splits the remainder on a page
+      // boundary. That is what makes the page count below exact.
+      TORCH_INTERNAL_ASSERT(
+          candidate->size % segment_size == 0,
+          "unmapped block is not a whole number of pages");
+      size_t take = std::min(candidate->size, (pages - filled) * segment_size);
+      // Goes through map_block on purpose, so these really are base-segment
+      // first mappings: total_allocated_memory / reserved_bytes are credited
+      // here, which is correct because this is new physical. Only the second
+      // mapping, on to the alias segment, must stay off the books.
+      if (!map_block(candidate, take, ctx)) {
+        return false;
+      }
+      const size_t got = take / segment_size;
+      for (size_t i = 0; i < got; ++i) {
+        PhysicalHandleKey handle = seg->handleAt(index + i);
+        if (handle == 0) {
+          LOG(ERROR)
+              << "expandable_segments_idle_remap: backfill mapped a page but found "
+              << "no handle at index " << index + i;
+          return false;
+        }
+        donors.emplace_back(seg, index + i, handle);
+      }
+      filled += got;
+    }
+    return true;
+  }
+
+  // Stitches idle donor pages into a freshly reserved VA range so a request the
+  // base segment cannot cover contiguously is served without allocating new
+  // physical for all of it. `va_exhausted` reports back that the reservation
+  // ran out of address space -- the one failure a VA reclaim can act on. An
+  // out-param, not a member: the reclaim drops the lock, where a member could
+  // be clobbered by another thread's malloc.
+  Block* try_alias_fill(
+      c10::DeviceIndex device,
+      cudaStream_t stream,
+      BlockPool* pool,
+      size_t size,
+      const std::shared_ptr<GatheredContext>& ctx,
+      c10::SmallVector<DonorPage, 8> donors,
+      bool* va_exhausted) {
+    if (!alias_fill_allowed(pool)) {
+      return nullptr;
+    }
+    TORCH_INTERNAL_ASSERT(!donors.empty());
+
+    const size_t segment_size = get_segment_size_for_pool(pool->is_small);
+    const size_t need_pages = (size + segment_size - 1) / segment_size;
+
+    // Stitch the idle donors first, and take new physical from the driver only
+    // for the shortfall, homed in a base segment. Never deliver a short
+    // segment: the caller assumes the block covers `size`, and the split
+    // arithmetic underflows otherwise.
+    if (donors.size() < need_pages) {
+      const size_t gap = need_pages - donors.size();
+      // The heaviest step on this path: real cuMemCreate calls.
+      if (!backfill_donor_pages(
+              device, stream, pool, segment_size, gap, ctx, donors)) {
+        // Out of physical for the shortfall. Whatever got mapped before the
+        // failure stays as ordinary free base-segment pages (the failing
+        // map_block rolls its own pages back), so nothing is stranded and the
+        // caller's fallback to the base path can reuse them.
+        VLOG(1)
+            << "expandable_segments_idle_remap: abandoning alias fill, backfill "
+            << "could not cover " << gap << " of " << need_pages << " pages";
+        return nullptr;
+      }
+    }
+
+    // Always freshly reserved. A fully-free alias segment keeps its mapping,
+    // and its VA is reused by get_free_block handing out its free block -- no
+    // driver call at all, which is what the steady state does.
+    AliasReserveResult reserve_result = AliasReserveResult::kError;
+    ExpandableSegment* alias_seg = ExpandableSegment::tryCreateAlias(
+        device,
+        stream,
+        segment_size,
+        devices_with_peer_access_,
+        donors.size(),
+        &reserve_result);
+    if (alias_seg == nullptr) {
+      // Anything other than an address-space shortage is a real error and must
+      // surface rather than be swallowed by the fallback.
+      TORCH_CHECK(
+          reserve_result == AliasReserveResult::kOutOfAddressSpace,
+          "expandable_segments_idle_remap: reserving ",
+          format_size(donors.size() * segment_size),
+          " of alias address space failed");
+      // Out of address space. Reclaiming needs a device synchronize, which must
+      // not happen under the allocator lock, so alloc_block drives it instead.
+      // Nothing is mapped and the ledger is untouched here, so both outcomes --
+      // retry or base-path fallback -- start from a clean state.
+      if (va_exhausted != nullptr) {
+        *va_exhausted = true;
+      }
+      LOG(WARNING)
+          << "expandable_segments_idle_remap: alias reservation ran out of address "
+          << "space; a VA reclaim may follow.";
+      return nullptr;
+    }
+    TORCH_INTERNAL_ASSERT(alias_seg->isAliasSegment());
+    alias_seg->setOwningPool(pool);
+
+    // Nothing else refers to the segment yet, so destroying it hands the VA
+    // straight back. No teardown assert on purpose: this unwinds a mapping
+    // failure, and throwing would turn a graceful fallback into a crash.
+    auto give_back_alias_segment = [&]() { delete alias_seg; };
+
+    size_t mapped = 0;
+    for (; mapped < donors.size(); ++mapped) {
+      // An alias segment must never hold a first mapping. Every page it maps
+      // comes from a base-segment home -- an idle donor or a backfilled one --
+      // so its positions sit at map_count >= 2 and releasing the segment never
+      // frees physical.
+      TORCH_INTERNAL_ASSERT(
+          donors[mapped].seg != nullptr &&
+              !donors[mapped].seg->isAliasSegment(),
+          "alias segment would take a first mapping");
+      if (!alias_seg->mapDonorHandle(mapped, donors[mapped].handle, pool)) {
+        LOG(ERROR)
+            << "expandable_segments_idle_remap: aborting alias fill, donor "
+            << "mapping failed at index " << mapped << " of " << donors.size();
+        break;
+      }
+      // Record the donor's base-segment home so the refcount gate counts it.
+      ensureAliasHomePoint(
+          *pool,
+          donors[mapped].handle,
+          donors[mapped].seg,
+          donors[mapped].index);
+    }
+    if (mapped != donors.size()) {
+      rollback_alias_mappings(alias_seg, mapped, segment_size);
+      give_back_alias_segment();
+      return nullptr;
+    }
+
+    const size_t alias_size = donors.size() * segment_size;
+    Block* block = new (std::nothrow)
+        Block(device, stream, alias_size, pool, alias_seg->ptr());
+    if (!block) {
+      LOG(ERROR)
+          << "expandable_segments_idle_remap: failed to allocate the Block "
+          << "for an alias segment";
+      rollback_alias_mappings(alias_seg, donors.size(), segment_size);
+      give_back_alias_segment();
+      return nullptr;
+    }
+    block->mapped = true;
+    block->expandable_segment_ = alias_seg;
+    block->registration_counter =
+        registration_counter_global.fetch_add(1, std::memory_order_relaxed) + 1;
+    // Deliberately not inserted into pool->blocks: the block is handed straight
+    // to the caller as an allocation, mirroring the base path's
+    // pool->erase_from_blocks(candidate). Leaving it in the free set would let
+    // get_free_block deliver the same address a second time, and the split path
+    // would mutate ptr/size while the block sits in the ordered sets.
+
+    // Claim the donor pages for this alias view. Without this the donors' base
+    // blocks stay free in pool->blocks and get_free_block would hand the same
+    // physical pages to a second allocation.
+    markPagesActive(
+        pool, alias_seg, static_cast<char*>(block->ptr), block->size);
+
+    // Deliberately does NOT touch total_allocated_memory / reserved_bytes:
+    // every donor page was already counted when its base-segment home was first
+    // mapped. Counting it again here would double-count the same physical page,
+    // inflate the watermark and cause spurious OOM against the fraction/gc
+    // threshold, which both read total_allocated_memory.
+
+    // Published only now: every failure path above destroys the segment without
+    // it ever appearing here, so release_alias_segment is the only remover.
+    alias_segments_.push_back(alias_seg);
+    return block;
+  }
+
+  // An alias reservation ran out of address space: hand back the VA of every
+  // fully-idle alias segment in this pool, then derive the allocation once
+  // more. The lock is dropped for the synchronize, as in the OOM retry chain.
+  Block* retry_after_alias_va_reclaim(
+      AllocParams& p,
+      const std::shared_ptr<GatheredContext>& ctx,
+      std::unique_lock<std::recursive_mutex>& lock) {
+    {
+      auto sg = c10::make_scope_exit([&]() { lock.lock(); });
+      lock.unlock();
+      C10_CUDA_CHECK(cudaDeviceSynchronize());
+    }
+    // A block freed with uses on another stream waits in cuda_events, not in
+    // pool.blocks, so the scan below would miss its segment. The synchronize
+    // just completed every such event. Capture is re-checked because the lock
+    // was dropped and cudaEventQuery is illegal during one.
+    if (C10_LIKELY(!is_capture_context())) {
+      process_events(ctx);
+    }
+    // Only now, with the lock retaken: any judgement made before the
+    // synchronize could have been invalidated while the lock was dropped.
+    std::vector<Block*> idle = collect_idle_alias_segments(*p.pool);
+    if (idle.empty()) {
+      // Nothing to hand back, so a retry would hit the same failure.
+      LOG(WARNING)
+          << "expandable_segments_idle_remap: alias VA exhausted and no fully-idle "
+          << "alias segment to reclaim; using the base-segment path.";
+      return nullptr;
+    }
+    // Everything idle goes, not just enough for one reservation, so the process
+    // does not sit against the VA ceiling repeating fail-synchronize-retry.
+    // An alias position is never a page's last mapping while its home survives,
+    // so this releases no physical: the VA is what goes back.
+    for (Block* block : idle) {
+      release_alias_segment(block);
+    }
+    // Derive again from the landing spot up: the failed attempt's candidate and
+    // donor list are both stale. Once only -- passing a null va_exhausted below
+    // is what stops a second failure from recursing back here.
+    return try_allocate_expandable_block(
+        p.device(),
+        p.stream(),
+        p.pool,
+        p.size(),
+        ctx,
+        /*va_exhausted=*/nullptr);
+  }
+
   Block* try_allocate_expandable_block(
       c10::DeviceIndex device,
       cudaStream_t stream,
       BlockPool* pool,
       size_t size,
-      const std::shared_ptr<GatheredContext>& ctx) {
+      const std::shared_ptr<GatheredContext>& ctx,
+      bool* va_exhausted) {
     Block* candidate = find_expandable_block(device, stream, pool, size);
     if (!candidate) {
       // No segment can ever be large enough for this allocation; fail the same
@@ -4027,6 +5359,44 @@ class DeviceCachingAllocator {
     // unmapped -> null
     // unmapped -> free -> *
     // free -> unmapped -> *
+
+    const size_t segment_size = get_segment_size_for_pool(pool->is_small);
+    const size_t need_pages = (size + segment_size - 1) / segment_size;
+
+    // Choose between first-mapping new physical into the base segment and
+    // re-mapping idle donor pages into an alias segment, whichever needs fewer
+    // cuMemCreate calls. New physical is needed whenever the candidate does not
+    // cover the request. That includes a mapped candidate that is too small, so
+    // this checks `size` and not only `!mapped`.
+    if ((!candidate->mapped || candidate->size < size) &&
+        alias_fill_allowed(pool)) {
+      const size_t adjacent_pages =
+          candidate->mapped ? candidate->size / segment_size : 0;
+      c10::SmallVector<DonorPage, 8> donors =
+          collectDonors(pool, stream, device, need_pages, segment_size);
+      if (donors.size() > adjacent_pages) {
+        // Abandon the base-segment first-map; its tail stays unmapped.
+        Block* alias_block = try_alias_fill(
+            device, stream, pool, size, ctx, std::move(donors), va_exhausted);
+        if (alias_block) {
+          return alias_block;
+        }
+        // Alias fill failed (VA exhausted, or no physical left for the backfill
+        // shortfall) - fall back to the base segment.
+        LOG(WARNING)
+            << "expandable_segments_idle_remap: alias fill failed, falling back to "
+            << "the base-segment first-map.";
+        // A backfill attempt maps pages through map_block, whose
+        // try_merge_blocks can absorb and delete `candidate` itself (it is a
+        // free mapped block whenever find_expandable_block walked back onto
+        // one). Re-derive the landing spot rather than carry a pointer that may
+        // already be gone.
+        candidate = find_expandable_block(device, stream, pool, size);
+        if (!candidate) {
+          return nullptr;
+        }
+      }
+    }
 
     if (!candidate->mapped &&
         !map_block(candidate, std::min(candidate->size, size), ctx)) {
@@ -4068,12 +5438,19 @@ class DeviceCachingAllocator {
 
     block->context_when_allocated = nullptr;
     size_t original_block_size = block->size;
+    void* original_block_ptr = block->ptr;
     size_t requested_size = block->requested_size;
 
     auto& pool = *block->pool;
     int64_t net_change_inactive_split_blocks = 0;
     int64_t net_change_inactive_split_size = 0;
 
+    // Merge unconditionally, whatever the neighbour's page ownership is.
+    // prev/next are in the same segment, so no other view is involved, and
+    // clearPagesActive below relies on adjacent free blocks being coalesced.
+    // Pages owned by another view are dealt with at allocation time
+    // (findBestFitUsableRange + confineBlockToRange). map_block cannot rely on
+    // that and checks `mergeable` itself.
     const std::array<Block*, 2> merge_candidates = {block->prev, block->next};
     for (Block* merge_candidate : merge_candidates) {
       const auto subsumed_size = try_merge_blocks(block, merge_candidate, pool);
@@ -4089,6 +5466,20 @@ class DeviceCachingAllocator {
     // NOLINTNEXTLINE(clang-analyzer-deadcode.DeadStores)
     bool inserted = pool.insert_into_blocks(block).second;
     TORCH_INTERNAL_ASSERT(inserted);
+
+    // Hand the pages this block occupied back to idle, so another view can take
+    // them. An alias segment going fully free needs nothing beyond this: it
+    // stays mapped so get_free_block can hand its VA out again, and "fully
+    // idle" is recomputed where a reclaim needs it. No-op unless the page is
+    // aliased.
+    if (block->expandable_segment_) {
+      clearPagesActive(
+          &pool,
+          block->expandable_segment_,
+          block,
+          original_block_ptr,
+          original_block_size);
+    }
 
     if (block->is_split()) {
       net_change_inactive_split_blocks += 1;
@@ -4254,15 +5645,51 @@ class DeviceCachingAllocator {
   }
 
   bool get_free_block(AllocParams& p) {
-    BlockPool& pool = *p.pool;
-
     if (allowed_memory_maximum.has_value() &&
         AcceleratorAllocatorConfig::garbage_collection_threshold() > 0.0)
         [[unlikely]] {
       // Track block reuse interval only when garbage collection is enabled.
-      ++pool.get_free_blocks_call_count;
+      // Lives here rather than in the pass below so that the two-pass search
+      // still ages each block exactly once per allocation.
+      ++p.pool->get_free_blocks_call_count;
     }
+    // Once aliasing is in play, try base-segment free blocks before alias ones.
+    // Taking an alias block makes its donor page active in the alias view,
+    // which poisons the donor's home VA in the base segment, so use a base
+    // block first. With an empty ledger there are no alias blocks and this is a
+    // single pass, identical to the baseline.
+    if (C10_UNLIKELY(!p.pool->aliased_handles_.empty())) {
+      // The second pass is not limited to alias blocks. It also revisits base
+      // blocks, which costs a little walking and can only find more.
+      return get_free_block_pass(p, /*allow_alias=*/false) ||
+          get_free_block_pass(p, /*allow_alias=*/true);
+    }
+    return get_free_block_pass(p, /*allow_alias=*/true);
+  }
+
+  bool get_free_block_pass(AllocParams& p, bool allow_alias) {
+    BlockPool& pool = *p.pool;
+
+    auto excluded = [allow_alias](Block* b) {
+      return !allow_alias && b->expandable_segment_ &&
+          b->expandable_segment_->isAliasSegment();
+    };
+    // Advances past candidates this pass does not consider. Stops at the end of
+    // the stream's run, which the callers check for anyway.
+    auto advance =
+        [&](std::set<Block*, BlockComparatorSizeCounterAddress>::iterator i) {
+          ++i;
+          while (i != pool.blocks.end() && (*i)->stream == p.stream() &&
+                 excluded(*i)) {
+            ++i;
+          }
+          return i;
+        };
     auto it = pool.blocks.lower_bound(&p.search_key);
+    while (it != pool.blocks.end() && (*it)->stream == p.stream() &&
+           excluded(*it)) {
+      ++it;
+    }
     if (it == pool.blocks.end() || (*it)->stream != p.stream())
       return false;
 
@@ -4276,12 +5703,12 @@ class DeviceCachingAllocator {
         auto expandable_size = [](Block* b) {
           return b->size + (b->next && !b->next->mapped ? b->next->size : 0);
         };
-        auto next = it;
-        next++;
+        auto next = advance(it);
         while ((*it)->expandable_segment_ && next != pool.blocks.end() &&
                (*next)->stream == p.stream() &&
                expandable_size(*next) < expandable_size(*it)) {
-          it = next++;
+          it = next;
+          next = advance(it);
         }
       } else {
         // Rarely expandable segments has been turned off after we have
@@ -4308,6 +5735,54 @@ class DeviceCachingAllocator {
         ((*it)->size >=
          p.size() + AcceleratorAllocatorConfig::max_non_split_rounding_size()))
       return false;
+
+    // A candidate may rest partly on pages another segment's view owns, and
+    // serving those would let two allocations write one physical page through
+    // two addresses. Deliver the best-fit usable range of the block instead, or
+    // move on to the next candidate if no range is long enough.
+    if (C10_UNLIKELY(!pool.aliased_handles_.empty())) {
+      UsableRange range = findBestFitUsableRange(&pool, *it, p.size());
+      while (range.size < p.size()) {
+        it = advance(it);
+        if (it == pool.blocks.end() || (*it)->stream != p.stream()) {
+          return false;
+        }
+        // The guards above are per-candidate, so re-apply them as we advance.
+        if ((p.size() < AcceleratorAllocatorConfig::max_split_size()) &&
+            ((*it)->size >= AcceleratorAllocatorConfig::max_split_size())) {
+          return false;
+        }
+        if ((p.size() >= AcceleratorAllocatorConfig::max_split_size()) &&
+            ((*it)->size >= p.size() +
+                 AcceleratorAllocatorConfig::max_non_split_rounding_size())) {
+          return false;
+        }
+        range = findBestFitUsableRange(&pool, *it, p.size());
+      }
+
+      Block* block = *it;
+      // Erase before confining: that mutates ptr/size, which order both sets.
+      pool.erase_from_blocks(block);
+      if (!confineBlockToRange(pool, block, range)) {
+        // Could not carve the surrounding bytes off, so the block cannot be
+        // delivered from its usable range. Put it back untouched.
+        pool.insert_into_blocks(block);
+        return false;
+      }
+      // The block now spans exactly the usable range, which rests only on pages
+      // of its own view. Check just the p.size() bytes the caller keeps,
+      // because it splits the tail beyond that off. Both this and
+      // findBestFitUsableRange skip the per-page lookups while the segment's
+      // poisoned-page count is zero, so neither would notice a stale count.
+      // markPagesActive does: it reads the ledger directly when
+      // alloc_found_block claims the pages.
+      TORCH_INTERNAL_ASSERT(
+          blockPagesUsable(&pool, block, p.size()),
+          "delivered block still covers a page owned by another segment view");
+      p.block = block;
+      return true;
+    }
+
     p.block = *it;
     pool.erase_from_blocks(p.block);
     return true;
@@ -4441,8 +5916,12 @@ class DeviceCachingAllocator {
     }
 
     if (p.is_expandable_segments_active) {
+      bool va_exhausted = false;
       p.block = try_allocate_expandable_block(
-          p.device(), p.stream(), p.pool, p.size(), ctx);
+          p.device(), p.stream(), p.pool, p.size(), ctx, &va_exhausted);
+      if (!p.block && va_exhausted && C10_LIKELY(!is_capture_context())) {
+        p.block = retry_after_alias_va_reclaim(p, ctx, lock);
+      }
       if (p.block) {
         p.err = cudaSuccess;
         if (p.pool->owner_PrivatePool) {
@@ -4816,6 +6295,13 @@ class DeviceCachingAllocator {
   void release_blocks(
       BlockPool& pool,
       const std::shared_ptr<GatheredContext>& context) {
+    // Fully-idle alias segments go first: while an alias maps a page, the
+    // refcount gate in disposeHandleAt keeps its physical, so letting the alias
+    // go is what lets the base side below actually hand that physical back.
+    for (Block* block : collect_idle_alias_segments(pool)) {
+      release_alias_segment(block);
+    }
+
     std::vector<Block*> to_unmap;
     // Frees all non-split blocks
     auto it = pool.blocks.begin();
@@ -4823,6 +6309,21 @@ class DeviceCachingAllocator {
       Block* block = *it;
       ++it;
       if (block->expandable_segment_) {
+        if (block->expandable_segment_->isAliasSegment()) {
+          // An alias segment that is not fully idle still serves an allocation.
+          // It must not go through unmap_block either: that deducts
+          // reserved_bytes / total_allocated_memory that alias fill never
+          // added.
+          continue;
+        }
+        // A base segment still donating a page to a live alias must stay
+        // mapped: its physical is kept resident through the alias, and
+        // unmap_block would wrongly deduct accounting and tear down the home
+        // mapping. Reclaim it on a later pass, once the alias has returned the
+        // page.
+        if (blockHasDonatedPage(&pool, block)) {
+          continue;
+        }
         // unmapping will mutate the free pool
         // so just gather what needs to be freed
         // to avoid invalidating the iterator

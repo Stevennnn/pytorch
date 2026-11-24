@@ -27,6 +27,19 @@ bool CUDAAllocatorConfig::expandable_segments() {
 #endif
 }
 
+bool CUDAAllocatorConfig::expandable_segments_idle_remap() {
+  if (!instance().m_expandable_segments_idle_remap) {
+    return false;
+  }
+  if (!expandable_segments()) {
+    TORCH_WARN_ONCE(
+        "expandable_segments_idle_remap requires expandable_segments:True; "
+        "ignoring it.")
+    return false;
+  }
+  return true;
+}
+
 size_t CUDAAllocatorConfig::parseAllocatorConfig(
     const c10::CachingAllocator::ConfigTokenizer& tokenizer,
     size_t i,
@@ -117,6 +130,9 @@ void CUDAAllocatorConfig::parseArgs(const std::string& env) {
       used_native_specific_option = true;
     } else if (key == "throw_on_cudamalloc_oom") {
       i = parseThrowOnCudaMallocOom(tokenizer, i);
+      used_native_specific_option = true;
+    } else if (key == "expandable_segments_idle_remap") {
+      i = parseExpandableSegmentsIdleRemap(tokenizer, i);
       used_native_specific_option = true;
     } else if (key == "expandable_segments_reserve") {
       i = parseExpandableSegmentsReserve(tokenizer, i);
@@ -223,6 +239,15 @@ size_t CUDAAllocatorConfig::parseThrowOnCudaMallocOom(
   // would likely fail due to insufficient memory.
   tokenizer.checkToken(++i, ":");
   m_throw_on_cudamalloc_oom = tokenizer.toBool(++i);
+  return i;
+}
+
+size_t CUDAAllocatorConfig::parseExpandableSegmentsIdleRemap(
+    const c10::CachingAllocator::ConfigTokenizer& tokenizer,
+    size_t i) {
+  // Format: expandable_segments_idle_remap:True or :False
+  tokenizer.checkToken(++i, ":");
+  m_expandable_segments_idle_remap = tokenizer.toBool(++i);
   return i;
 }
 

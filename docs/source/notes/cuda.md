@@ -735,6 +735,38 @@ PYTORCH_CUDA_ALLOC_CONF=per_process_memory_fraction:0.95,throw_on_cudamalloc_oom
   server process. With this option, the serving framework can catch the `OutOfMemoryError`
   and reject the individual request while continuing to serve subsequent requests.
 
+* `expandable_segments_idle_remap` (experimental, default: `False`)
+   Requires `expandable_segments:True`; without it the option is ignored with a warning.
+   When set to `True`, a large-pool request that the base segment cannot cover contiguously
+   may be served by mapping the physical pages of idle expandable-segment blocks a second
+   time into freshly reserved address space, instead of allocating new physical memory for
+   all of it. This trades address space for `cuMemCreate` calls, which reduces fragmentation
+   driven growth when free memory is scattered across many partially used segments.
+
+   The second mapping does not change accounting: an alias range is a view over physical
+   that is already counted, so `reserved_bytes` and `allocated_bytes` are unaffected, and
+   alias ranges are omitted from the segments reported by
+   {func}`torch.cuda.memory._snapshot`. A physical page is only ever served through one of
+   its mappings at a time.
+
+   The option is ignored while expandable segment IPC handles are enabled
+   (`TORCH_CUDA_EXPANDABLE_SEGMENTS_IPC`, on by default outside fbcode builds), because a
+   page exported to another process cannot also be described by a second local mapping. It
+   applies to the default large pool only: private memory pools (CUDA graphs,
+   {class}`torch.cuda.MemPool`) and the small pool are unaffected.
+
+   Two limitations are worth knowing when debugging memory behaviour:
+
+   * `torch.cuda.empty_cache()` cannot return the base-segment physical that a *live*
+     alias allocation is still mapped over, so `memory_reserved()` can stay above its
+     baseline until that allocation is freed. Idle alias ranges are released first, which
+     is what lets the rest go back.
+   * An allocation served from an alias range emits `alloc` / `free_requested` /
+     `free_completed` history entries at an address that no `segment_alloc` or
+     `segment_map` entry ever covered, since the alias range is not reported as a segment.
+     {func}`torch.cuda.memory._segment_plot` and the trace timeline will therefore show
+     those addresses as unbacked.
+
 ```{note}
 
     Some stats reported by the
