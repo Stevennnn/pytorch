@@ -930,16 +930,24 @@ struct ExpandableSegment {
 #endif
       return false;
     }
-    // Access for this device and every peer, exactly as mapAndSetAccess does:
-    // cuMemSetAccess is per address range, so the alias range needs its own.
+    // Access is granted once for the whole alias range by setAliasAccess(), not
+    // per page. Nothing can reach this VA until try_alias_fill returns the
+    // Block, so the mapped-but-inaccessible window is unobservable.
     handles_.at(index) = Handle{.handle = handle, .mapped = true};
     mapped_size_ += segment_size_;
-    setAccess(device_, index, index + 1);
-    for (auto p : peers_) {
-      setAccess(p, index, index + 1);
-    }
     addAliasLedgerPoint(*pool, handle_key, this, index);
     return true;
+  }
+
+  // One cuMemSetAccess for [begin, end) instead of one per mapped page.
+  void setAliasAccess(size_t begin, size_t end) {
+    if (begin >= end) {
+      return;
+    }
+    setAccess(device_, begin, end);
+    for (auto p : peers_) {
+      setAccess(p, begin, end);
+    }
   }
 
   // begin must be aligned to segment_size_.
@@ -1688,6 +1696,7 @@ struct ExpandableSegment {
   bool mapDonorHandle(size_t index, PhysicalHandleKey handle, BlockPool* pool) {
     return false;
   }
+  void setAliasAccess(size_t begin, size_t end) {}
   bool isAliasSegment() const {
     return false;
   }
@@ -5254,6 +5263,7 @@ class DeviceCachingAllocator {
       give_back_alias_segment();
       return nullptr;
     }
+    alias_seg->setAliasAccess(0, donors.size());
 
     const size_t alias_size = donors.size() * segment_size;
     Block* block = new (std::nothrow)
